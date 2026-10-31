@@ -1,0 +1,24 @@
+# SAM deploy configuration template for athlenz-event-processor.
+#
+# Copy this file to `samconfig.toml` and adjust values as needed.
+# `samconfig.toml` itself is gitignored.
+#
+# With this in place you can deploy with a plain `sam deploy` (no --guided).
+
+version = 0.1
+
+[default.global.parameters]
+stack_name = "athlenz-event-processor"
+
+[default.build.parameters]
+use_container = false
+
+[default.deploy.parameters]
+stack_name = "athlenz-event-processor"
+region = "eu-west-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+parameter_overrides = [
+  "StravaSecretId=strava/client-credentials",
+]

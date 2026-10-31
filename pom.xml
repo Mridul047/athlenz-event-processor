@@ -1,0 +1,318 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>io.cb.strava</groupId>
+    <artifactId>athlenz-event-processor</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <!--
+      Standalone Strava webhook PROCESSOR function.
+
+      Plain Java 21 on the AWS Lambda java21 runtime, built with Maven and
+      deployed with the AWS SAM CLI. No application framework: the handler
+      implements the AWS Lambda RequestHandler directly against the SQS event
+      types. Helper libraries only (Jackson for JSON, AWS SDK v2 for DynamoDB,
+      Secrets Manager and SQS, and the JDK's built-in java.net.http.HttpClient
+      for the Strava API calls).
+
+      SQS-triggered: consumes webhook events from the queue, resolves the
+      owning athlete's OAuth token (refreshing via Secrets Manager-held client
+      credentials when needed), fetches the detailed activity from the Strava
+      API, and persists it to DynamoDB idempotently. Returns an SQSBatchResponse
+      so only failed messages are retried (partial batch responses).
+
+      The maven-shade-plugin produces the single fat jar that Lambda runs.
+    -->
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- AWS SDK v2 BOM: pin only the modules we use. -->
+        <aws.sdk.version>2.28.16</aws.sdk.version>
+
+        <!-- AWS Lambda Java libraries. -->
+        <aws.lambda.core.version>1.2.3</aws.lambda.core.version>
+        <aws.lambda.events.version>3.11.4</aws.lambda.events.version>
+
+        <!-- Jackson for JSON (de)serialization. -->
+        <jackson.version>2.17.2</jackson.version>
+
+        <!-- OpenAPI Generator: version pinned (no parent pom supplies one). -->
+        <openapi-generator.plugin.version>7.8.0</openapi-generator.plugin.version>
+        <!-- OpenAPI Generator output for the generated Strava models. -->
+        <openapi-generator-output>${project.build.directory}/generated-sources/openapi</openapi-generator-output>
+
+        <!-- Support libs for the generated models. -->
+        <jackson-databind-nullable.version>0.2.6</jackson-databind-nullable.version>
+
+        <!-- SLF4J + simple backend (stdout -> CloudWatch via Lambda). -->
+        <slf4j.version>2.0.13</slf4j.version>
+
+        <!-- Test. -->
+        <junit.version>5.10.3</junit.version>
+        <mockito.version>5.12.0</mockito.version>
+
+        <!-- Plugins. -->
+        <maven.compiler.plugin.version>3.13.0</maven.compiler.plugin.version>
+        <maven.shade.plugin.version>3.6.0</maven.shade.plugin.version>
+        <maven.surefire.plugin.version>3.2.5</maven.surefire.plugin.version>
+        <fmt-maven-plugin.version>2.29</fmt-maven-plugin.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${aws.sdk.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- ===== AWS Lambda runtime ===== -->
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-lambda-java-core</artifactId>
+            <version>${aws.lambda.core.version}</version>
+        </dependency>
+        <!-- SQSEvent / SQSBatchResponse. -->
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-lambda-java-events</artifactId>
+            <version>${aws.lambda.events.version}</version>
+        </dependency>
+
+        <!-- ===== JSON ===== -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <!-- JavaTimeModule: java.time support when parsing Strava responses. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+        <!--
+          Required by the OpenAPI-generated Strava models: some generator 7.x
+          versions emit a JsonNullable import even with openApiNullable=false.
+          Matches the reference project's declared version.
+        -->
+        <dependency>
+            <groupId>org.openapitools</groupId>
+            <artifactId>jackson-databind-nullable</artifactId>
+            <version>${jackson-databind-nullable.version}</version>
+        </dependency>
+        <!--
+          The generated models carry jakarta.annotation.Generated (from the
+          generator's useJakartaEe=true). Provided transitively in the Micronaut
+          reference; declared explicitly here in this framework-free build.
+        -->
+        <dependency>
+            <groupId>jakarta.annotation</groupId>
+            <artifactId>jakarta.annotation-api</artifactId>
+            <version>2.1.1</version>
+        </dependency>
+
+        <!-- ===== AWS SDK v2: the modules the processor needs ===== -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>dynamodb</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>dynamodb-enhanced</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>secretsmanager</artifactId>
+        </dependency>
+        <!-- SQS: used only by the dev-only local runner. -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>sqs</artifactId>
+        </dependency>
+        <!-- Lean HTTP client for the AWS SDK: small footprint, fast cold start. -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>url-connection-client</artifactId>
+        </dependency>
+
+        <!-- ===== Logging ===== -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+
+        <!-- ===== Test ===== -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-junit-jupiter</artifactId>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>${project.artifactId}</finalName>
+        <plugins>
+            <!-- Code formatter (Google Java Format). -->
+            <plugin>
+                <groupId>com.spotify.fmt</groupId>
+                <artifactId>fmt-maven-plugin</artifactId>
+                <version>${fmt-maven-plugin.version}</version>
+                <configuration>
+                    <!--
+                      Only format our own hand-written sources. The OpenAPI
+                      generator writes models under target/generated-sources,
+                      which must not be reformatted (and are not under these
+                      roots anyway) — scoping here keeps that explicit.
+                    -->
+                    <sourceDirectory>${project.basedir}/src/main/java</sourceDirectory>
+                    <testSourceDirectory>${project.basedir}/src/test/java</testSourceDirectory>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>format</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven.compiler.plugin.version}</version>
+                <configuration>
+                    <release>21</release>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven.surefire.plugin.version}</version>
+            </plugin>
+
+            <!--
+              Shade plugin builds the single deployable fat jar Lambda runs.
+              The ServicesResourceTransformer merges META-INF/services files so
+              SLF4J and the AWS SDK service lookups keep working in the fat jar.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>${maven.shade.plugin.version}</version>
+                <configuration>
+                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                </configuration>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <transformers>
+                                <transformer
+                                        implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!--
+              OpenAPI Generator: generate typed Strava MODELS from the swagger
+              spec at build time (generate-sources). Models only
+              (generateApis=false); the HTTP calls are made with the JDK
+              HttpClient, not a generated API client. Generated sources land
+              under target/generated-sources/openapi and are added to the
+              compile source root automatically. Mirrors the reference
+              project's generate-strava-models execution; the plugin version is
+              pinned here because this standalone build has no parent pom to
+              manage it.
+            -->
+            <plugin>
+                <groupId>org.openapitools</groupId>
+                <artifactId>openapi-generator-maven-plugin</artifactId>
+                <version>${openapi-generator.plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>generate-strava-models</id>
+                        <goals>
+                            <goal>generate</goal>
+                        </goals>
+                        <phase>generate-sources</phase>
+                        <configuration>
+                            <inputSpec>${project.basedir}/src/main/resources/strava-swagger-v3.json</inputSpec>
+                            <generatorName>java</generatorName>
+                            <library>native</library>
+                            <modelPackage>com.strava.api.v3.model</modelPackage>
+                            <apiPackage>com.strava.api.v3.api</apiPackage>
+                            <invokerPackage>com.strava.api.v3</invokerPackage>
+                            <output>${openapi-generator-output}</output>
+                            <addCompileSourceRoot>true</addCompileSourceRoot>
+                            <!-- Models only: the JDK HttpClient handles HTTP. -->
+                            <generateApis>false</generateApis>
+                            <generateApiTests>false</generateApiTests>
+                            <generateModelTests>false</generateModelTests>
+                            <generateApiDocumentation>false</generateApiDocumentation>
+                            <generateModelDocumentation>false</generateModelDocumentation>
+                            <generateSupportingFiles>false</generateSupportingFiles>
+                            <configOptions>
+                                <useJakartaEe>true</useJakartaEe>
+                                <openApiNullable>false</openApiNullable>
+                                <dateLibrary>java8</dateLibrary>
+                                <serializationLibrary>jackson</serializationLibrary>
+                                <hideGenerationTimestamp>true</hideGenerationTimestamp>
+                                <!--
+                                  The 'native' library emits a toUrlQueryString()
+                                  method in each model that calls ApiClient
+                                  .valueToString(). ApiClient is a supporting
+                                  file we intentionally do not generate
+                                  (models only), so disable the query-string
+                                  helper to avoid referencing it.
+                                -->
+                                <supportUrlQuery>false</supportUrlQuery>
+                            </configOptions>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

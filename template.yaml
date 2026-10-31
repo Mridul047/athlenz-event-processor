@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  athlenz-event-processor — standalone Strava webhook processor function.
+  Plain Java 21 on Lambda (no framework), triggered by SQS. It resolves the
+  owning athlete's OAuth token (refreshing via Secrets Manager-held client
+  credentials when needed), fetches the detailed activity from the Strava API,
+  and persists it to DynamoDB idempotently. Consumes the SQS queue the ingest
+  app publishes to.
+
+Parameters:
+  StravaSecretId:
+    Type: String
+    Default: strava/client-credentials
+    Description: >
+      Name/id of the Secrets Manager secret holding the Strava client
+      credentials as JSON ({"client_id":"...","client_secret":"..."}). This
+      stack creates the secret with a placeholder value; update it after deploy.
+  EventQueueArn:
+    Type: String
+    Description: >
+      ARN of the SQS queue to consume. This queue is OWNED by the ingest stack
+      (athlenz-event-ingestor); copy its EventQueueArn output here.
+      Deploy the ingest stack first, then pass its output to this stack.
+  EventQueueName:
+    Type: String
+    Description: >
+      Name of the SQS queue to consume (the ingest stack's EventQueueName
+      output). Used only to scope the SQS poller IAM policy to that queue.
+
+Globals:
+  Function:
+    Runtime: java21
+    MemorySize: 512
+    Timeout: 30
+    Architectures:
+      - x86_64
+
+Resources:
+
+  # The SQS queue (+ DLQ) this function consumes is OWNED by the ingest stack
+  # (athlenz-event-ingestor), not created here. Its ARN is passed in via the
+  # EventQueueArn parameter. This keeps a single shared queue between the two
+  # stacks: ingest publishes, this processor consumes.
+
+  # ---- DynamoDB tables ----
+  # Per-athlete OAuth tokens (state), keyed by athleteId.
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: athleteId
+          AttributeType: N
+      KeySchema:
+        - AttributeName: athleteId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  # Persisted activities, keyed by activityId.
+  ActivitiesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: activityId
+          AttributeType: N
+      KeySchema:
+        - AttributeName: activityId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  # ---- Secrets Manager: Strava client credentials ----
+  # Created with a placeholder; update the value after deploy (e.g. via the
+  # console or `aws secretsmanager put-secret-value`). Never commit real values.
+  StravaClientCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref StravaSecretId
+      Description: Strava OAuth client credentials (client_id/client_secret) as JSON.
+      SecretString: '{"client_id":"REPLACE_ME","client_secret":"REPLACE_ME"}'
+
+  # ---- Processor function ----
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: io.cb.strava.worker.WebhookWorkerHandler::handleRequest
+      Environment:
+        Variables:
+          STATE_TABLE_NAME: !Ref StateTable
+          ACTIVITIES_TABLE_NAME: !Ref ActivitiesTable
+          STRAVA_SECRET_ID: !Ref StravaSecretId
+          STRAVA_API_BASE_URL: https://www.strava.com/api/v3
+          STRAVA_TOKEN_URL: https://www.strava.com/oauth/token
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StateTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ActivitiesTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref StravaClientCredentialsSecret
+        # The queue lives in the ingest stack, so SAM cannot auto-derive the
+        # consume permissions from a local resource; grant them explicitly,
+        # scoped to the passed-in queue name.
+        - SQSPollerPolicy:
+            QueueName: !Ref EventQueueName
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !Ref EventQueueArn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+Outputs:
+  ConsumedQueueArn:
+    Description: >
+      ARN of the SQS queue this processor consumes. Owned by the ingest stack
+      (athlenz-event-ingestor) and passed in via the EventQueueArn parameter.
+    Value: !Ref EventQueueArn
+  StateTableName:
+    Description: DynamoDB table of per-athlete OAuth tokens.
+    Value: !Ref StateTable
+  ActivitiesTableName:
+    Description: DynamoDB table of persisted activities.
+    Value: !Ref ActivitiesTable
